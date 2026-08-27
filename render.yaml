@@ -1,0 +1,40 @@
+# ==================== РАЗВЁРТЫВАНИЕ НА RENDER ====================
+# Положи содержимое этой папки в корень ОТДЕЛЬНОГО репозитория и подключи его в Render
+# как Blueprint (New -> Blueprint) либо как обычный Web Service с этими же настройками.
+#
+# Зависимостей нет: build-команда пустая, npm install ничего не ставит.
+services:
+  - type: web
+    name: anode-server
+    runtime: node
+    plan: free
+    buildCommand: ""
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      # Имя, которое игроки увидят в списке.
+      - key: SERVER_NAME
+        value: "Кордон — свободная игра"
+      # Описание: раскрывается по тапу на карточке.
+      - key: SERVER_DESC
+        value: "Обычная Зона. PvP разрешён, торговцы работают."
+      - key: MAX_PLAYERS
+        value: "16"
+      - key: GAME_MAP
+        value: "kordon"
+      # Правила: имена через запятую или число.
+      #   no_bots, no_pvp, all_friendly, all_zombies, no_traders, army_hold, roleplay
+      # Примеры:
+      #   RULES=all_zombies            — режим смерти: весь мир зомбированные
+      #   RULES=army_hold,roleplay     — служба по РП на захваченной армией карте
+      #   RULES=no_bots,no_pvp         — пустая карта для встреч
+      - key: RULES
+        value: ""
+      # Свой публичный адрес. Render подставляет его сам в RENDER_EXTERNAL_URL, и
+      # задавать PUBLIC_URL руками нужно только если адрес свой (домен).
+      - key: PUBLIC_URL
+        sync: false
+      # Если этот сервер не единственный — адрес того, чей список игроки вбивают в игре.
+      # Оставь пустым у самого мастера.
+      - key: MASTER_URL
+        sync: false
