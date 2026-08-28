@@ -22,8 +22,15 @@ create table if not exists players (
   -- только хранит и отдаёт целиком тому, кому они принадлежат.
   inventory  jsonb   default '[]'::jsonb,
   equipment  jsonb   default '[]'::jsonb,
+  -- Выходил ли он хоть раз из этого мира. По нему, и только по нему, решается, ставить
+  -- человека на спавн или туда, где он вышел: угадывать новичка по пустому рюкзаку
+  -- значило бы отправлять к воротам каждого, кто вышел, продав всё подчистую.
+  spawned    boolean default false,
   seen_at    bigint  default 0
 );
+
+-- Если таблица уже была заведена прошлой версией - добавить недостающий столбец:
+alter table players add column if not exists spawned boolean default true;
 
 -- Кто заходил недавно - по этому удобно смотреть живых игроков.
 create index if not exists players_seen_at_idx on players (seen_at desc);

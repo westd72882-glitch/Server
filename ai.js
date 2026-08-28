@@ -59,9 +59,13 @@ const PLAYER_FACTION = FACTION.MILITARY;
 // ==================== ХАБАР ====================
 // Копия того, что раньше разыгрывал клиент (NPC.cpp): ствол редко, патроны часто, броня
 // по стороне. Идентификаторы предметов - из Game/Items/Items.h.
+// НОМЕРА - ИЗ enum ItemId В src/Game/Player/Player.h, буква в букву. Раньше они были
+// переписаны по памяти и разъехались с игрой на две-три позиции: сервер клал в тело
+// «патроны 3», игра читала это как КПК, а вместо хлеба выпадал бронекостюм ПСЗ. Ошибка
+// такого рода не падает и не пишет в лог - она просто выдаёт не тот предмет.
 const ITEM = {
-  AMMO_545: 3, AMMO_9x18: 4, BANDAGE: 6, MEDKIT: 7, BREAD: 8, VODKA: 9,
-  ARMOR: 10, SUIT_JACKET: 11, SUIT_BERILL: 12, SUIT_PSZ: 13, SUIT_ECO: 14,
+  MEDKIT: 2, ARMOR: 4, AMMO_545: 5, AMMO_9x18: 6,
+  SUIT_JACKET: 7, SUIT_PSZ: 8, SUIT_BERILL: 9, SUIT_ECO: 13,
   WEAPON_BASE: 1000,
 };
 function ammoFor(gun) { return gun === 1 ? ITEM.AMMO_9x18 : ITEM.AMMO_545; }
@@ -95,9 +99,9 @@ function rollLoot(n, rnd) {
     } else if (roll < 0.10) suit = ITEM.SUIT_ECO;
     if (suit) push(suit, 1, lo + rnd() * (hi - lo));
   }
-  if (rnd() < 0.18) push(ITEM.BANDAGE, 1);
-  if (rnd() < 0.32) push(ITEM.BREAD, 1);
-  if (rnd() < 0.06) push(ITEM.MEDKIT, 1);
+  // Аптечка - единственная расходная мелочь, которая в игре есть. Бинтов, хлеба и водки в
+  // таблице предметов нет вовсе, и класть их в тело значило бы класть туда чужие номера.
+  if (rnd() < 0.20) push(ITEM.MEDKIT, 1);
   return loot;
 }
 

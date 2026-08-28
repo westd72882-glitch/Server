@@ -40,6 +40,23 @@ const cache = new Map();     // ник (в нижнем регистре) -> п�
 const dirty = new Set();     // чьи профили изменились с прошлой записи
 const SAVE_EVERY_MS = 30000;
 
+// ==================== С ЧЕМ ЧЕЛОВЕК ПРИХОДИТ В ЗОНУ ====================
+// Куртка сталкера и КПК. Раздаёт их СЕРВЕР, а не телефон: рюкзак живёт в профиле, и всё,
+// что телефон положит себе сам, первым же тактом затрётся серверным. Раньше набор выдавал
+// клиент при новой игре - и в сетевой партии новичок оставался голым, потому что профиль
+// приходил пустым и переписывал ему руки.
+//
+// КПК здесь не подарок, а условие входа: без него не видно ни карты, ни меток, ни
+// заданий. Оба лежат В РЮКЗАКЕ, а не надеты - надеть их игрок должен сам.
+// Номера - из enum ItemId в src/Game/Player/Player.h.
+const ITEM_PDA = 3, ITEM_SUIT_JACKET = 7;
+function starterKit() {
+  return [
+    { item: ITEM_SUIT_JACKET, n: 1, cond: 1 },
+    { item: ITEM_PDA, n: 1, cond: 1 },
+  ];   // ITEM_SUIT_JACKET = 7, ITEM_PDA = 3
+}
+
 function emptyProfile(nick) {
   return {
     nick,                    // как игрок его написал, с регистром
@@ -47,8 +64,13 @@ function emptyProfile(nick) {
     kills: 0,
     hp: 100,
     x: 0, y: 0, z: 0,
-    inventory: [],           // [{item, n, cond}]
+    inventory: starterKit(),
     equipment: [],           // [{slot, item, n, cond}]
+    // Выходил ли он хоть раз из этого мира. По нему, и ТОЛЬКО по нему, решается, ставить
+    // человека на спавн или туда, где он вышел. Раньше «новичка» угадывали по пустому
+    // рюкзаку - и любой, кто вышел, продав всё подчистую, при следующем входе оказывался
+    // не там, где оставил себя, а у ворот.
+    spawned: false,
     seenAt: 0,
   };
 }
@@ -106,6 +128,7 @@ async function supaLoad(nick) {
     nick: r.nick, money: r.money | 0, kills: r.kills | 0, hp: +r.hp || 100,
     x: +r.x || 0, y: +r.y || 0, z: +r.z || 0,
     inventory: r.inventory || [], equipment: r.equipment || [],
+    spawned: !!r.spawned,
     seenAt: r.seen_at || 0,
   };
 }
@@ -119,6 +142,7 @@ async function supaSave(p) {
       money: p.money | 0, kills: p.kills | 0, hp: p.hp,
       x: p.x, y: p.y, z: p.z,
       inventory: p.inventory, equipment: p.equipment,
+      spawned: !!p.spawned,
       seen_at: p.seenAt,
     }),
   });
@@ -154,6 +178,11 @@ async function dbGet(nick) {
     try { p = await supaLoad(nick); } catch (e) { console.log('БД: чтение - ' + e.message); }
   }
   if (!p) p = emptyProfile(String(nick));
+  // Профиль мог быть заведён старой версией сервера - тогда полей ещё нет. Проставляем их
+  // здесь, а не в каждом месте, где они читаются.
+  if (p.spawned === undefined) p.spawned = true;   // раз он уже есть, новичком не считаем
+  if (!Array.isArray(p.inventory)) p.inventory = [];
+  if (!Array.isArray(p.equipment)) p.equipment = [];
   cache.set(k, p);
   return p;
 }

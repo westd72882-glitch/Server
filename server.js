@@ -39,7 +39,7 @@
 const http = require('http');
 const { dbInit, dbGet, dbTouch, dbFlush, dbRelease } = require('./db');
 const { buildRoster, makeRng } = require('./world');
-const { aiTick, initNpc, npcDie, TICK } = require('./ai');
+const { aiTick, initNpc, npcDie, TICK, PLAYER_FACTION } = require('./ai');
 
 // ==================== ПРАВИЛА ====================
 // Значения обязаны совпадать с GameRuleBit в src/Game/Net/GameRules.h. Расходиться им
@@ -269,6 +269,11 @@ async function handleJoin(req, res) {
   // деньги, рюкзак, надетое - лежит на сервере под этим ником и возвращается ему.
   const prof = await dbGet(name);
   prof.nick = name;             // регистр берём из последнего входа
+  // НОВИЧОК ЛИ ОН - решается ДО того, как мы что-либо в профиле поменяем, и по явному
+  // признаку, а не по пустому рюкзаку. Считать новичком всякого с пустыми руками значило
+  // бы отправлять к воротам каждого, кто вышел, продав всё подчистую.
+  const firstTime = !prof.spawned;
+  prof.spawned = true;
   prof.seenAt = now();
 
   const token = makeToken();
@@ -307,7 +312,7 @@ async function handleJoin(req, res) {
       money: prof.money, kills: prof.kills, hp: p.hp,
       x: prof.x, y: prof.y, z: prof.z,
       inventory: prof.inventory, equipment: prof.equipment,
-      fresh: prof.seenAt === 0 || (!prof.inventory.length && !prof.equipment.length),
+      fresh: firstTime,
     },
   });
 }
@@ -443,7 +448,13 @@ async function handleState(req, res) {
     players: list.filter(p => p.id !== me.id).map(p => ({
       id: p.id, name: p.name, x: p.x, y: p.y, z: p.z,
       yaw: p.yaw, move: p.move, hp: p.hp, flags: p.flags, gun: p.gun,
+      // Деньги и сторона - для списка игроков, который открывается тапом по миникарте.
+      // Кошелёк здесь не тайна: партия общая, переводы идут по имени, и знать, кому есть
+      // чем платить, - часть игры, а не подглядывание.
+      money: p.prof.money | 0, f: PLAYER_FACTION,
     })),
+    // Имя сервера в такте - чтобы список игроков подписывался им, не переспрашивая.
+    sname: CFG.name,
   };
 
   if (me.chat.length) { out.chat = me.chat; me.chat = []; }
@@ -477,7 +488,7 @@ async function handleState(req, res) {
       if (!n.alive && worldClock > n.corpseAt) continue;   // тело уже ушло в землю
       const dx = n.x - me.x, dz = n.z - me.z;
       const d2 = dx * dx + dz * dz;
-      if (d2 > 140 * 140) continue;
+      if (d2 > 125 * 125) continue;
       near.push({ d2, n });
     }
     near.sort((a, b) => a.d2 - b.d2);
@@ -498,7 +509,10 @@ async function handleState(req, res) {
       // Ожил - забываем, что хабар был отдан: в следующий раз он будет другой.
       if (n.alive && me.lootSent) me.lootSent.delete(n.i);
       outNpcs.push(e);
-      if (outNpcs.length >= 64) break;
+      // Предел подняли с шестидесяти четырёх: бойцов в мире под восемьдесят, и упор в
+      // предел означал, что дальние ПРОСТО СТОЯТ - обновления до них не доходили, и
+      // человек, обошедший карту, встречал десяток замерших столбов.
+      if (outNpcs.length >= 96) break;
     }
     if (outNpcs.length) out.npcs = outNpcs;
   }
@@ -510,6 +524,19 @@ async function handleLeave(req, res) {
   const body = await readBody(req);
   const p = body && body.token ? players.get(body.token) : null;
   if (p) {
+    // ПОСЛЕДНЕЕ СЛОВО ОБ ИМУЩЕСТВЕ. Клиент присылает рюкзак вместе с прощанием: всё, что
+    // он подобрал после последнего удачного такта, известно только ему, и другого случая
+    // это записать уже не будет.
+    if (body.inv) {
+      if (Array.isArray(body.inventory)) p.prof.inventory = body.inventory.slice(0, 64);
+      if (Array.isArray(body.equipment)) p.prof.equipment = body.equipment.slice(0, 8);
+      if (Number.isFinite(+body.money)) p.prof.money = Math.max(0, +body.money | 0);
+      if (Number.isFinite(+body.kills)) p.prof.kills = Math.max(0, +body.kills | 0);
+    }
+    p.prof.x = p.x; p.prof.y = p.y; p.prof.z = p.z;
+    p.prof.hp = p.hp;
+    p.prof.seenAt = now();
+    dbTouch(p.name);
     players.delete(body.token);
     broadcastChat(`${p.name} вышел`, p.id);
     console.log(`leave: ${p.name} (#${p.id}), онлайн ${alivePlayers().length}`);
