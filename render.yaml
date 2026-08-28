@@ -30,6 +30,18 @@ services:
       #   RULES=no_bots,no_pvp         — пустая карта для встреч
       - key: RULES
         value: ""
+      # Сюжет в сетевой партии: enable ставит на карту торговца, квестодателей и всю
+      # цепочку заданий. По умолчанию его нет - цепочка рассчитана на одного.
+      - key: SUZHET
+        value: "disable"
+      - key: MIN_NICK
+        value: "5"
+      # Профили игроков. Без Supabase они лежат в JSON-файле и не переживают перезапуск
+      # на бесплатном тарифе - см. README.
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
       # Свой публичный адрес. Render подставляет его сам в RENDER_EXTERNAL_URL, и
       # задавать PUBLIC_URL руками нужно только если адрес свой (домен).
       - key: PUBLIC_URL

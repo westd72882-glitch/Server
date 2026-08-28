@@ -23,11 +23,23 @@
 //                        army_hold, roleplay
 //                 пример: RULES=army_hold,roleplay  - служба по РП на захваченной карте
 //                 пример: RULES=all_zombies         - режим смерти
+//   SUZHET        сюжет в партии: enable / disable        (disable)
+//   MIN_NICK      минимальная длина ника                 (5)
 //   MASTER_URL    если задан, сервер регистрируется в чужом списке ("")
 //   PORT          порт (Render задаёт сам)
+//
+// ==================== ХРАНИЛИЩЕ ====================
+//   DATA_DIR      куда класть players.json                (./data)
+//   SUPABASE_URL  адрес проекта Supabase - тогда профили лежат в настоящей базе ("")
+//   SUPABASE_KEY  сервисный ключ ("")
+//   SUPABASE_TABLE имя таблицы                            (players)
+// Подробности и схема таблицы - в db.js и README.
 'use strict';
 
 const http = require('http');
+const { dbInit, dbGet, dbTouch, dbFlush, dbRelease } = require('./db');
+const { buildRoster, makeRng } = require('./world');
+const { aiTick, initNpc, npcDie, TICK } = require('./ai');
 
 // ==================== ПРАВИЛА ====================
 // Значения обязаны совпадать с GameRuleBit в src/Game/Net/GameRules.h. Расходиться им
@@ -40,11 +52,17 @@ const RULE = {
   no_traders:   1 << 4,
   army_hold:    1 << 5,
   roleplay:     1 << 6,
+  // Сюжет в сетевой партии. По умолчанию его НЕТ: цепочка заданий рассчитана на одного,
+  // и десять человек, берущих у Монгола одно и то же задание, - очередь, а не игра.
+  // Владелец сервера вправе решить иначе - тогда на карте появляются торговец,
+  // квестодатели и вся цепочка (SUZHET=enable).
+  story:        1 << 7,
 };
 const RULE_NAMES_RU = {
   no_bots: 'Без ботов', no_pvp: 'Без PvP', all_friendly: 'Все дружелюбны',
   all_zombies: 'Все зомби', no_traders: 'Без торговцев',
   army_hold: 'Армия: всё захвачено', roleplay: 'Служба по РП',
+  story: 'Сюжет включён',
 };
 
 function parseRules(raw) {
@@ -82,7 +100,9 @@ const CFG = {
   desc: process.env.SERVER_DESC || '',
   max: parseInt(process.env.MAX_PLAYERS || '16', 10),
   map: process.env.GAME_MAP || 'kordon',
-  rules: parseRules(process.env.RULES),
+  rules: parseRules(process.env.RULES) |
+         (/^(1|on|yes|true|enable|enabled)$/i.test(process.env.SUZHET || '') ? RULE.story : 0),
+  minNick: Math.max(1, parseInt(process.env.MIN_NICK || '5', 10)),
   masterUrl: (process.env.MASTER_URL || '').replace(/\/+$/, ''),
   publicUrl: (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, ''),
   port: parseInt(process.env.PORT || '10000', 10),
@@ -102,9 +122,15 @@ let nextId = 1;
 
 const PLAYER_TIMEOUT_MS = 10000;   // молчит дольше - значит, ушёл
 const DROP_LIFETIME_MS = 10 * 60 * 1000;
-const NPC_LIFETIME_MS = 5000;      // состояние бойца от ведущего живёт недолго
 
-const npcs = new Map();        // индекс бойца -> его состояние от ведущего
+// ==================== БОЙЦЫ ====================
+// Живут ЗДЕСЬ и считаются здесь (см. ai.js). Ведущего-клиента больше нет: раньше мир
+// водил один из телефонов, у него боты шли без задержки, а у остальных с опозданием, и
+// его выход перекидывал всю карту на другого. Теперь мир один и он серверный.
+let npcs = [];                 // состояния бойцов, индекс = номер в ростере
+let roster = [];               // описание состава: его получает каждый входящий
+const npcRnd = makeRng(0);     // общий генератор для ИИ: разброс, хабар, маршруты
+let worldClock = 0;            // секунды с запуска мира - по ним живут таймеры ИИ
 const drops = new Map();       // netId -> вещь на земле
 const peersRegistry = new Map(); // url -> чужой сервер, зарегистрировавшийся у нас
 
@@ -114,18 +140,17 @@ function alivePlayers() {
   const t = now();
   const out = [];
   for (const [token, p] of players) {
-    if (t - p.lastSeen > PLAYER_TIMEOUT_MS) { players.delete(token); continue; }
+    if (t - p.lastSeen > PLAYER_TIMEOUT_MS) {
+      players.delete(token);
+      // Связь оборвалась, а не человек нажал «выйти»: профиль надо сохранить тем же
+      // порядком, иначе потерянная сеть означала бы потерянный рюкзак.
+      if (p.name) { dbTouch(p.name); dbFlush().catch(() => {}); }
+      console.log(`timeout: ${p.name} (#${p.id})`);
+      continue;
+    }
     out.push(p);
   }
   return out;
-}
-
-// Ведущий - тот, кто вошёл раньше всех: у него наименьший номер. Правило то же, что было
-// в прежней версии игры, и выбрано оно за то, что не требует переговоров.
-function leaderId() {
-  let best = -1;
-  for (const p of alivePlayers()) if (best < 0 || p.id < best) best = p.id;
-  return best;
 }
 
 function makeToken() {
@@ -204,6 +229,29 @@ async function handleRegister(req, res) {
   sendJson(res, 200, { ok: true });
 }
 
+// Ник - это ИМЯ УЧЁТНОЙ ЗАПИСИ, а не подпись под сообщением: к нему привязаны деньги,
+// рюкзак и всё нажитое. Отсюда два требования.
+//
+// НЕ КОРОЧЕ ПЯТИ СИМВОЛОВ - чтобы «ы» и «12» не растащили нормальные имена в первый же
+// день, и чтобы ник было видно с трёх метров на карточке трупа.
+//
+// НЕ СОВПАДАЕТ С ЧУЖИМ, КТО СЕЙЧАС В ИГРЕ - иначе двое делят один профиль, и чей-то
+// рюкзак перезапишется чужим. Сравнение регистронезависимое: «Вова» и «вова» для
+// человека одно и то же имя, и позволить войти обоим значило бы обмануть его.
+function nickProblem(raw) {
+  const name = String(raw || '').trim();
+  // Длину считаем в СИМВОЛАХ, а не в байтах: кириллица в UTF-8 двухбайтовая, и по
+  // байтам «Вова» оказалось бы длиной восемь.
+  const len = [...name].length;
+  if (len < CFG.minNick) return `Имя должно быть от ${CFG.minNick} символов`;
+  if (len > 18) return 'Имя длиннее 18 символов';
+  if (/[\s]/.test(name)) return 'В имени не должно быть пробелов';
+  for (const p of alivePlayers()) {
+    if (p.name.toLowerCase() === name.toLowerCase()) return 'Это имя уже занято';
+  }
+  return null;
+}
+
 async function handleJoin(req, res) {
   const body = await readBody(req);
   if (!body) return sendJson(res, 400, { ok: false, error: 'нечитаемый запрос' });
@@ -213,22 +261,54 @@ async function handleJoin(req, res) {
   if (alivePlayers().length >= CFG.max) {
     return sendJson(res, 200, { ok: false, error: 'Сервер заполнен' });
   }
+  const name = String(body.name || '').trim();
+  const bad = nickProblem(name);
+  if (bad) return sendJson(res, 200, { ok: false, error: bad });
+
+  // ПРОФИЛЬ ПОДНИМАЕТСЯ ИЗ ХРАНИЛИЩА. Всё, что у человека было в прошлый заход, - его
+  // деньги, рюкзак, надетое - лежит на сервере под этим ником и возвращается ему.
+  const prof = await dbGet(name);
+  prof.nick = name;             // регистр берём из последнего входа
+  prof.seenAt = now();
 
   const token = makeToken();
   const p = {
-    id: nextId++, token,
-    name: String(body.name || 'Сталкер').slice(0, 18),
-    x: 0, y: 0, z: 0, yaw: 0, move: 0, hp: 100, flags: 0, gun: -1,
+    id: nextId++, token, name,
+    prof,
+    x: prof.x, y: prof.y, z: prof.z, yaw: 0, move: 0,
+    hp: prof.hp > 0 ? prof.hp : 100,
+    flags: 0, gun: -1,
     lastSeen: now(),
-    chat: [], pays: [], npcHits: [],
+    chat: [], pays: [],
   };
   players.set(token, p);
+  dbTouch(name);
   broadcastChat(`${p.name} вошёл в игру`, p.id);
-  console.log(`join: ${p.name} (#${p.id}), онлайн ${alivePlayers().length}`);
+  console.log(`join: ${p.name} (#${p.id}), онлайн ${alivePlayers().length}, ` +
+              `денег ${prof.money}, вещей ${prof.inventory.length}`);
 
   sendJson(res, 200, {
-    ok: true, id: p.id, token, leader: leaderId() === p.id,
+    ok: true, id: p.id, token,
     rules: CFG.rules, seed: WORLD_SEED, name: CFG.name, map: CFG.map,
+    // СОСТАВ МИРА ЦЕЛИКОМ. Клиент строит по нему свой ростер и ничего не разыгрывает:
+    // общее зерно требовало бы, чтобы обе стороны считали одним генератором, и любая
+    // правка таблицы отрядов молча расходилась бы с сервером.
+    // Клиенту нужно только то, по чему он строит бойца: номер, имя, сторона, модель,
+    // ствол, роль и где он стоит. Маршруты, отряды и таймеры возрождения - дело сервера,
+    // и возить их по сети незачем.
+    roster: roster.map(r => ({
+      i: r.i, name: r.name, f: r.f, model: r.model, gun: r.gun,
+      role: r.role, st: r.stationary ? 1 : 0,
+      x: +r.x.toFixed(2), z: +r.z.toFixed(2),
+    })),
+    // Имущество отдаём ЦЕЛИКОМ и только здесь: в такте оно не меняется настолько часто,
+    // чтобы гонять его десять раз в секунду.
+    profile: {
+      money: prof.money, kills: prof.kills, hp: p.hp,
+      x: prof.x, y: prof.y, z: prof.z,
+      inventory: prof.inventory, equipment: prof.equipment,
+      fresh: prof.seenAt === 0 || (!prof.inventory.length && !prof.equipment.length),
+    },
   });
 }
 
@@ -258,7 +338,26 @@ async function handleState(req, res) {
   const claimed = +body.hp;
   if (Number.isFinite(claimed) && claimed < me.hp) me.hp = claimed;
 
-  const isLeader = leaderId() === me.id;
+  // ---- ИМУЩЕСТВО ----
+  // Рюкзак, надетое и деньги живут в профиле на сервере. Клиент присылает их, когда они
+  // у него изменились (он ставит "inv":1), а не каждый такт: содержимое рюкзака меняется
+  // раз в минуту, а тактов десять в секунду.
+  //
+  // Сервер здесь ДОВЕРЯЕТ клиенту содержимое: разбирать, законно ли у человека появился
+  // экзоскелет, значило бы перенести на сервер весь подбор лута, торговлю и крафт - то
+  // есть всю игру. Это осознанная граница: сервер отвечает за то, чтобы имущество не
+  // терялось и не путалось между людьми, а не за то, чтобы никто не жульничал.
+  if (body.inv) {
+    if (Array.isArray(body.inventory)) me.prof.inventory = body.inventory.slice(0, 64);
+    if (Array.isArray(body.equipment)) me.prof.equipment = body.equipment.slice(0, 8);
+    if (Number.isFinite(+body.money)) me.prof.money = Math.max(0, +body.money | 0);
+    if (Number.isFinite(+body.kills)) me.prof.kills = Math.max(0, +body.kills | 0);
+    dbTouch(me.name);
+  }
+  // Место и здоровье пишем в профиль всегда: по ним человек и вернётся туда, где вышел.
+  me.prof.x = me.x; me.prof.y = me.y; me.prof.z = me.z;
+  me.prof.hp = me.hp;
+  me.prof.seenAt = now();
 
   // ---- Попадания по людям ----
   if (Array.isArray(body.hits) && !pvpDisabled(CFG.rules)) {
@@ -280,8 +379,15 @@ async function handleState(req, res) {
     for (const pay of body.pays) {
       const sum = Math.max(0, pay.sum | 0);
       if (!sum) continue;
-      const target = alivePlayers().find(p => p.name === String(pay.to));
+      const target = alivePlayers().find(
+        p => p.name.toLowerCase() === String(pay.to).trim().toLowerCase());
       if (!target) { me.chat.push(`Игрок ${pay.to} не найден`); continue; }
+      // Деньги переезжают В ПРОФИЛЯХ, а не только в чужом кошельке на экране: иначе
+      // перевод пропадал бы при следующей записи профиля отправителя.
+      if (me.prof.money < sum) { me.chat.push('Столько денег нет'); continue; }
+      me.prof.money -= sum;
+      target.prof.money += sum;
+      dbTouch(me.name); dbTouch(target.name);
       target.pays.push({ from: me.name, sum });
     }
   }
@@ -305,16 +411,21 @@ async function handleState(req, res) {
   }
 
   // ---- Бойцы ----
-  if (isLeader && Array.isArray(body.npcs)) {
-    const t = now();
-    for (const n of body.npcs) npcs.set(n.i | 0, { ...n, t });
-  }
-  if (!isLeader && Array.isArray(body.npchits)) {
-    // Попадание ведомого по бойцу решает ведущий: он их считает. Складываем в очередь -
-    // заберёт следующим своим тактом.
-    const leader = alivePlayers().find(p => p.id === leaderId());
-    if (leader) for (const h of body.npchits) {
-      leader.npcHits.push({ i: h.i | 0, dmg: +h.dmg || 0, from: me.id });
+  // ---- Попадания по бойцам ----
+  // Решает СЕРВЕР, и только он: раньше это письмо шло ведущему-клиенту, и убитым боец
+  // считался только у него. Здоровье бойца - такое же общее знание, как и здоровье
+  // человека, и хранить его в чужом телефоне значило бы спорить о том, кто жив.
+  if (Array.isArray(body.npchits)) {
+    for (const h of body.npchits) {
+      const n = npcs[h.i | 0];
+      if (!n || !n.alive) continue;
+      const dmg = Math.max(0, Math.min(500, +h.dmg || 0));
+      n.hp -= dmg;
+      n.lastHitBy = me.id;
+      // Валим НА МЕСТЕ, а не ждём такта ИИ. Между двумя тактами помещается сколько
+      // угодно запросов, и мёртвый боец успевал принять ещё пять очередей - а стрелявший
+      // всё это время видел живого.
+      if (n.hp <= 0) { npcKill(n, me); me.prof.kills = (me.prof.kills | 0) + 1; dbTouch(me.name); }
     }
   }
 
@@ -323,9 +434,11 @@ async function handleState(req, res) {
   const list = alivePlayers();
   const out = {
     ok: true,
-    leader: isLeader,
     rules: CFG.rules,
     hp: me.hp,
+    // Деньги - слово сервера: их меняют переводы от других людей, и клиент обязан
+    // услышать об этом, а не только о своих тратах.
+    money: me.prof.money,
     online: list.length,
     players: list.filter(p => p.id !== me.id).map(p => ({
       id: p.id, name: p.name, x: p.x, y: p.y, z: p.z,
@@ -335,7 +448,6 @@ async function handleState(req, res) {
 
   if (me.chat.length) { out.chat = me.chat; me.chat = []; }
   if (me.pays.length) { out.pays = me.pays; me.pays = []; }
-  if (isLeader && me.npcHits.length) { out.npchits = me.npcHits; me.npcHits = []; }
   if (me.taken && me.taken.length) { out.taken = me.taken; me.taken = []; }
 
   // Вещи на земле шлём только те, которых этот игрок ещё не видел: полный список каждый
@@ -351,18 +463,44 @@ async function handleState(req, res) {
     if (fresh.length) out.drops = fresh;
   }
 
-  // Бойцы - только ведомым и только те, что рядом с этим игроком: весь ростер в JSON
-  // превратился бы в десятки килобайт на каждого за такт.
-  if (!isLeader) {
+  // ---- Бойцы ----
+  // Отдаём тех, кто рядом с ЭТИМ игроком: весь ростер в JSON превратился бы в десятки
+  // килобайт на каждого за такт. Сортируем по дистанции, а не берём первых попавшихся:
+  // при упоре в предел ближние важнее - именно их человек видит.
+  //
+  // Y не шлём вовсе: высоту земли клиент считает сам той же функцией рельефа, что и в
+  // одиночной игре. Она чистая - от x и z, - поэтому у всех совпадает до последнего бита,
+  // а в эфире это четверть объёма записи о бойце.
+  {
     const near = [];
-    for (const [i, n] of npcs) {
-      if (t - n.t > NPC_LIFETIME_MS) { npcs.delete(i); continue; }
+    for (const n of npcs) {
+      if (!n.alive && worldClock > n.corpseAt) continue;   // тело уже ушло в землю
       const dx = n.x - me.x, dz = n.z - me.z;
-      if (dx * dx + dz * dz > 90 * 90) continue;
-      near.push({ i: n.i, x: n.x, y: n.y, z: n.z, r: n.r, m: n.m, h: n.h, f: n.f });
-      if (near.length >= 40) break;
+      const d2 = dx * dx + dz * dz;
+      if (d2 > 140 * 140) continue;
+      near.push({ d2, n });
     }
-    if (near.length) out.npcs = near;
+    near.sort((a, b) => a.d2 - b.d2);
+    const outNpcs = [];
+    for (const { n } of near) {
+      const e = {
+        i: n.i, x: +n.x.toFixed(2), z: +n.z.toFixed(2),
+        r: +n.rotY.toFixed(2), m: n.move,
+        h: Math.round(n.hp),
+        f: (n.firing ? 1 : 0) | (n.alive ? 2 : 0),
+      };
+      // Хабар отдаём только по мёртвым и только тому, кто ещё его не получал: он весит
+      // больше, чем всё остальное про бойца вместе взятое.
+      if (n.loot && !n.alive) {
+        me.lootSent ||= new Set();
+        if (!me.lootSent.has(n.i)) { e.loot = n.loot; me.lootSent.add(n.i); }
+      }
+      // Ожил - забываем, что хабар был отдан: в следующий раз он будет другой.
+      if (n.alive && me.lootSent) me.lootSent.delete(n.i);
+      outNpcs.push(e);
+      if (outNpcs.length >= 64) break;
+    }
+    if (outNpcs.length) out.npcs = outNpcs;
   }
 
   sendJson(res, 200, out);
@@ -375,6 +513,10 @@ async function handleLeave(req, res) {
     players.delete(body.token);
     broadcastChat(`${p.name} вышел`, p.id);
     console.log(`leave: ${p.name} (#${p.id}), онлайн ${alivePlayers().length}`);
+    // Дописываем профиль НЕМЕДЛЕННО: следующая плановая запись через полминуты, а
+    // человек, вышедший и тут же вошедший обратно, за эти полминуты потерял бы всё
+    // нажитое за последний заход.
+    await dbRelease(p.name);
   }
   sendJson(res, 200, { ok: true });
 }
@@ -413,9 +555,50 @@ function registerAtMaster() {
   req.end(payload);
 }
 
+// ==================== МИР ЗАПУСКАЕТСЯ ЗДЕСЬ ====================
+// Убит человеком. Хабар и таймеры - общим путём смерти (ai.js), чтобы они не разошлись с
+// тем, что происходит, когда бойца добивают другие боты.
+function npcKill(n, byPlayer) {
+  npcDie(n, npcRnd, worldClock);
+  console.log(`${byPlayer.name} убил бойца #${n.i} (${n.name})`);
+}
+
+function worldInit() {
+  roster = buildRoster(WORLD_SEED, CFG.rules);
+  npcs = roster.map(initNpc);
+  console.log(`Мир: собрано бойцов ${npcs.length} (зерно ${WORLD_SEED})`);
+}
+
+// ==================== ТАКТ ИИ ====================
+// Идёт ВСЕГДА, а не только когда кто-то в игре: мир должен жить своей жизнью, чтобы
+// вошедший попадал в идущий бой, а не в застывшую картинку. Когда сервер пуст, это
+// десять проходов в секунду по сотне записей - меньше, чем стоит один HTTP-запрос.
+function worldTick() {
+  worldClock += TICK;
+  // Игроки для ИИ: только то, что ему нужно, плюс способ нанести урон. Отдавать сюда сам
+  // объект игрока значило бы позволить ИИ трогать его токен и профиль.
+  const people = alivePlayers().map(p => ({
+    id: p.id, x: p.x, z: p.z, alive: p.hp > 0,
+    // Правило «без PvP» - про стрельбу МЕЖДУ ЛЮДЬМИ; боты стреляют по-прежнему.
+    // Мир без ботов задаётся отдельным правилом, и путать эти два незачем.
+    damage: (d) => {
+      p.hp = Math.max(0, p.hp - d);
+      p.prof.hp = p.hp;
+    },
+  }));
+  aiTick(npcs, people, CFG.rules, npcRnd, worldClock);
+}
+
+worldInit();
+setInterval(worldTick, Math.round(TICK * 1000));
+
+dbInit().catch(e => console.log('БД: ' + e.message));
+
 server.listen(CFG.port, () => {
   console.log(`A.N.O.D.E: «${CFG.name}» слушает порт ${CFG.port}`);
   console.log(`  карта: ${CFG.map}, мест: ${CFG.max}, режим: ${modeText(CFG.rules)} (rules=${CFG.rules})`);
+  console.log(`  сюжет: ${(CFG.rules & RULE.story) ? 'включён' : 'выключен'}, ник от ${CFG.minNick} символов`);
+  console.log(`  бойцов в мире: ${npcs.length} - считает СЕРВЕР, ведущего-клиента нет`);
   console.log(`  адрес в списке: ${CFG.publicUrl || '(PUBLIC_URL не задан - в список себя не отдам)'}`);
   if (CFG.masterUrl) {
     registerAtMaster();
